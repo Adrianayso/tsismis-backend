@@ -37,15 +37,52 @@ const FEEDS = [
 
 const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 
-function getImage(item) {
-  if (item.mediaContent && item.mediaContent['$'] && item.mediaContent['$'].url) return item.mediaContent['$'].url;
-  if (item.mediaThumbnail && item.mediaThumbnail['$'] && item.mediaThumbnail['$'].url) return item.mediaThumbnail['$'].url;
-  if (item.enclosure && item.enclosure.url) return item.enclosure.url;
-  if (item['media:content'] && item['media:content']['$']) return item['media:content']['$'].url || '';
-  // Try extracting from content/summary
+// Cache og:images so we don't re-fetch the same URLs
+const imageCache = new Map();
+
+function getImageFromItem(item) {
+  // Try all RSS image fields
+  if (item.mediaContent?.['$']?.url) return item.mediaContent['$'].url;
+  if (item.mediaThumbnail?.['$']?.url) return item.mediaThumbnail['$'].url;
+  if (item.enclosure?.url) return item.enclosure.url;
+  if (item['media:content']?.['$']?.url) return item['media:content']['$'].url;
+
+  // Try extracting from HTML content
   const html = item['content:encoded'] || item.content || item.summary || '';
-  const match = html.match(/<img[^>]+src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i);
-  if (match && match[1].startsWith('http')) return match[1];
+  const imgMatch = html.match(/<img[^>]+src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i);
+  if (imgMatch && imgMatch[1].startsWith('http')) return imgMatch[1];
+
+  return '';
+}
+
+async function getOgImage(url) {
+  if (!url) return '';
+  if (imageCache.has(url)) return imageCache.get(url);
+
+  try {
+    const res = await fetch(url, {
+      timeout: 5000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' }
+    });
+    const html = await res.text();
+
+    // Try og:image first
+    const ogMatch = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i)
+                 || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:image"/i);
+    if (ogMatch && ogMatch[1].startsWith('http')) {
+      imageCache.set(url, ogMatch[1]);
+      return ogMatch[1];
+    }
+
+    // Try twitter:image
+    const twitterMatch = html.match(/<meta[^>]+name="twitter:image"[^>]+content="([^"]+)"/i);
+    if (twitterMatch && twitterMatch[1].startsWith('http')) {
+      imageCache.set(url, twitterMatch[1]);
+      return twitterMatch[1];
+    }
+  } catch (e) {}
+
+  imageCache.set(url, '');
   return '';
 }
 
@@ -63,11 +100,13 @@ async function fetchFeed(feedInfo) {
       const desc = (item['content:encoded'] || item.contentSnippet || item.summary || '')
         .replace(/<[^>]+>/g, '').trim().slice(0, 250);
 
+      const rssImage = getImageFromItem(item);
+
       articles.push({
         title: item.title.trim(),
         description: desc,
         url: item.link || item.guid || '',
-        urlToImage: getImage(item),
+        urlToImage: rssImage,
         publishedAt: pubDate ? new Date(pubDate).toISOString() : new Date().toISOString(),
         source: { name: feedInfo.source }
       });
@@ -86,6 +125,7 @@ app.get('/news', async (req, res) => {
     let all = [];
     results.forEach(r => { if (r.status === 'fulfilled') all = all.concat(r.value); });
 
+    // Deduplicate
     const seen = new Set();
     const unique = all.filter(a => {
       const key = a.title.slice(0, 60).toLowerCase();
@@ -95,8 +135,20 @@ app.get('/news', async (req, res) => {
     });
 
     unique.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-    console.log(`Serving ${unique.length} articles`);
-    res.json({ articles: unique.slice(0, 120) });
+    const sliced = unique.slice(0, 120);
+
+    // Fill missing images by fetching og:image — do up to 30 at a time to stay fast
+    const noImage = sliced.filter(a => !a.urlToImage && a.url);
+    const toFetch = noImage.slice(0, 30);
+
+    await Promise.allSettled(
+      toFetch.map(async (a) => {
+        a.urlToImage = await getOgImage(a.url);
+      })
+    );
+
+    console.log(`Serving ${sliced.length} articles`);
+    res.json({ articles: sliced });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
