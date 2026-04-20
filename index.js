@@ -1,13 +1,23 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const RSSParser = require('rss-parser');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// rss2json converts any RSS feed to clean JSON automatically — free, no key needed
-const RSS2JSON = 'https://api.rss2json.com/v1/api.json?rss_url=';
+const parser = new RSSParser({
+  timeout: 10000,
+  headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' },
+  customFields: {
+    item: [
+      ['media:content', 'mediaContent', { keepArray: false }],
+      ['media:thumbnail', 'mediaThumbnail', { keepArray: false }],
+      ['enclosure', 'enclosure', { keepArray: false }],
+    ]
+  }
+});
 
 const FEEDS = [
   { url: 'https://www.rappler.com/feed/', source: 'Rappler' },
@@ -25,42 +35,47 @@ const FEEDS = [
   { url: 'https://mb.com.ph/feed', source: 'Manila Bulletin' },
 ];
 
-const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+
+function getImage(item) {
+  if (item.mediaContent && item.mediaContent['$'] && item.mediaContent['$'].url) return item.mediaContent['$'].url;
+  if (item.mediaThumbnail && item.mediaThumbnail['$'] && item.mediaThumbnail['$'].url) return item.mediaThumbnail['$'].url;
+  if (item.enclosure && item.enclosure.url) return item.enclosure.url;
+  if (item['media:content'] && item['media:content']['$']) return item['media:content']['$'].url || '';
+  // Try extracting from content/summary
+  const html = item['content:encoded'] || item.content || item.summary || '';
+  const match = html.match(/<img[^>]+src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i);
+  if (match && match[1].startsWith('http')) return match[1];
+  return '';
+}
 
 async function fetchFeed(feedInfo) {
   try {
-    const res = await fetch(`${RSS2JSON}${encodeURIComponent(feedInfo.url)}&count=20`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
-    const data = await res.json();
-
-    if (data.status !== 'ok' || !data.items) return [];
-
+    const feed = await parser.parseURL(feedInfo.url);
     const now = Date.now();
+    const articles = [];
 
-    return data.items
-      .filter(item => {
-        if (!item.title || item.title === '[Removed]') return false;
-        if (item.pubDate) {
-          const age = now - new Date(item.pubDate).getTime();
-          if (age > MAX_AGE_MS) return false;
-        }
-        return true;
-      })
-      .map(item => ({
-        title: item.title,
-        description: item.description
-          ? item.description.replace(/<[^>]+>/g, '').slice(0, 250)
-          : '',
-        url: item.link || item.guid,
-        urlToImage: item.thumbnail || item.enclosure?.link || '',
-        publishedAt: item.pubDate
-          ? new Date(item.pubDate).toISOString()
-          : new Date().toISOString(),
+    for (const item of feed.items || []) {
+      if (!item.title || item.title === '[Removed]') continue;
+      const pubDate = item.pubDate || item.isoDate;
+      if (pubDate && now - new Date(pubDate).getTime() > MAX_AGE_MS) continue;
+
+      const desc = (item['content:encoded'] || item.contentSnippet || item.summary || '')
+        .replace(/<[^>]+>/g, '').trim().slice(0, 250);
+
+      articles.push({
+        title: item.title.trim(),
+        description: desc,
+        url: item.link || item.guid || '',
+        urlToImage: getImage(item),
+        publishedAt: pubDate ? new Date(pubDate).toISOString() : new Date().toISOString(),
         source: { name: feedInfo.source }
-      }));
+      });
+    }
+
+    return articles;
   } catch (err) {
-    console.log(`Failed: ${feedInfo.source} — ${err.message}`);
+    console.log(`Failed ${feedInfo.source}: ${err.message}`);
     return [];
   }
 }
@@ -68,13 +83,9 @@ async function fetchFeed(feedInfo) {
 app.get('/news', async (req, res) => {
   try {
     const results = await Promise.allSettled(FEEDS.map(f => fetchFeed(f)));
-
     let all = [];
-    results.forEach(r => {
-      if (r.status === 'fulfilled') all = all.concat(r.value);
-    });
+    results.forEach(r => { if (r.status === 'fulfilled') all = all.concat(r.value); });
 
-    // Deduplicate by title
     const seen = new Set();
     const unique = all.filter(a => {
       const key = a.title.slice(0, 60).toLowerCase();
@@ -83,18 +94,14 @@ app.get('/news', async (req, res) => {
       return true;
     });
 
-    // Sort newest first
     unique.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-
-    console.log(`Fetched ${unique.length} articles from ${results.filter(r => r.status === 'fulfilled' && r.value.length > 0).length} sources`);
-
+    console.log(`Serving ${unique.length} articles`);
     res.json({ articles: unique.slice(0, 120) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Health check — visit /health in browser to see how many articles loaded
 app.get('/health', async (req, res) => {
   const results = await Promise.allSettled(FEEDS.map(f => fetchFeed(f)));
   const report = FEEDS.map((f, i) => ({
